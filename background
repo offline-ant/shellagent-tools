@@ -1,0 +1,224 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_name=$(basename "$0")
+
+usage() {
+    cat <<EOF
+$script_name wraps a tmux session so you can launch a long-running program, feed stdin, and dump stdout when you need it.
+
+Usage:
+  $script_name start <session> -- <command...>
+      Create (or replace) a detached tmux session named <session> running <command...>.
+      Example: $script_name start hppr -- ./tool/hpprd
+
+  $script_name send <session> [--no-newline] <text...>
+      Push <text> to the program's stdin. By default a trailing newline is sent.
+
+  $script_name capture <session> [--lines N]
+      Print the current pane contents. --lines limits the capture depth (default: full history).
+
+  $script_name attach <session>
+      Attach to the session interactively. Detach with the usual tmux keystroke (Ctrl-b d).
+
+  $script_name stop <session>
+      Terminate the session.
+
+  $script_name status
+      List managed tmux sessions.
+
+EOF
+}
+
+socket_path() {
+    printf "/tmp/background-%s" "$1"
+}
+
+require_tmux() {
+    if ! command -v tmux >/dev/null 2>&1; then
+        echo "error: tmux not found in PATH" >&2
+        exit 127
+    fi
+}
+
+tmux_exec() {
+    local session=$1
+    shift
+    tmux -S "$(socket_path "$session")" "$@"
+}
+
+session_exists() {
+    local session=$1
+    tmux_exec "$session" has-session -t "${session}:0" 2>/dev/null
+}
+
+ensure_session_exists() {
+    local session=$1
+    if ! session_exists "$session"; then
+        echo "error: tmux session '$session' not found" >&2
+        exit 1
+    fi
+}
+
+start_session() {
+    local session=$1
+    shift
+    if [[ $# -eq 0 ]]; then
+        echo "error: missing command for start" >&2
+        exit 1
+    fi
+    local sock
+    sock=$(socket_path "$session")
+    if session_exists "$session"; then
+        tmux_exec "$session" kill-session -t "$session" || true
+    elif [[ -S $sock ]]; then
+        rm -f "$sock"
+    fi
+    tmux -S "$sock" new-session -d -s "$session" "$@"
+    echo "started tmux session '$session' (window 0, pane 0)"
+}
+
+send_input() {
+    local newline=1
+    local session
+    local text
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --no-newline)
+                newline=0
+                shift
+                ;;
+            *)
+                session=$1
+                shift
+                text=$*
+                break
+                ;;
+        esac
+    done
+
+    if [[ -z ${session:-} ]]; then
+        echo "error: missing session for send" >&2
+        exit 1
+    fi
+
+    ensure_session_exists "$session"
+    if [[ -n ${text:-} ]]; then
+        tmux_exec "$session" send-keys -t "${session}:0" "$text"
+    else
+        echo "warning: nothing to send" >&2
+    fi
+    if [[ $newline -eq 1 ]]; then
+        tmux_exec "$session" send-keys -t "${session}:0" C-m
+    fi
+}
+
+capture_output() {
+    local lines=""
+    local session
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --lines)
+                shift
+                if [[ $# -eq 0 ]]; then
+                    echo "error: --lines expects a value" >&2
+                    exit 1
+                fi
+                lines=$1
+                shift
+                ;;
+            *)
+                session=$1
+                shift
+                ;;
+        esac
+    done
+
+    if [[ -z ${session:-} ]]; then
+        echo "error: missing session for capture" >&2
+        exit 1
+    fi
+
+    ensure_session_exists "$session"
+    if [[ -n $lines ]]; then
+        tmux_exec "$session" capture-pane -pt "${session}:0" -S "-${lines}"
+    else
+        tmux_exec "$session" capture-pane -pt "${session}:0"
+    fi
+}
+
+case $# in
+    0)
+        usage
+        exit 1
+        ;;
+esac
+
+require_tmux
+
+command=$1
+shift
+
+case $command in
+    start)
+        if [[ $# -lt 2 ]]; then
+            echo "error: usage: $script_name start <session> -- <command...>" >&2
+            exit 1
+        fi
+        session=$1
+        shift
+        if [[ $1 == "--" ]]; then
+            shift
+        fi
+        start_session "$session" "$@"
+        ;;
+    send)
+        send_input "$@"
+        ;;
+    capture)
+        capture_output "$@"
+        ;;
+    attach)
+        if [[ $# -ne 1 ]]; then
+            echo "error: usage: $script_name attach <session>" >&2
+            exit 1
+        fi
+        ensure_session_exists "$1"
+        sock=$(socket_path "$1")
+        exec tmux -S "$sock" attach -t "$1"
+        ;;
+    stop)
+        if [[ $# -ne 1 ]]; then
+            echo "error: usage: $script_name stop <session>" >&2
+            exit 1
+        fi
+        ensure_session_exists "$1"
+        tmux_exec "$1" kill-session -t "$1"
+        sock=$(socket_path "$1")
+        rm -f "$sock"
+        echo "stopped tmux session '$1'"
+        ;;
+    status)
+        shopt -s nullglob
+        found=0
+        for sock in /tmp/background-*; do
+            [[ -S $sock ]] || continue
+            session=${sock#/tmp/background-}
+            if tmux -S "$sock" has-session -t "${session}:0" 2>/dev/null; then
+                tmux -S "$sock" list-sessions || true
+                found=1
+            fi
+        done
+        shopt -u nullglob
+        if [[ $found -eq 0 ]]; then
+            echo "no background tmux sessions"
+        fi
+        ;;
+    *)
+        echo "error: unknown command '$command'" >&2
+        usage
+        exit 1
+        ;;
+esac

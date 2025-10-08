@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+
+"""
+code-scan - Scan source files (.rs, .py, .js) and provide function/class/struct overview
+Usage: ./tool/code-scan [directory]
+"""
+
+import os
+import sys
+import re
+import glob
+from pathlib import Path
+
+def find_source_files(directory):
+    """Find all .rs, .py, .js files in the directory, excluding common build/cache dirs"""
+    source_files = []
+    exclude_dirs = {'target', 'node_modules', '__pycache__', '.git', 'dist', 'build'}
+    
+    for root, dirs, files in os.walk(directory):
+        # Skip excluded directories
+        dirs[:] = [d for d in dirs if d not in exclude_dirs]
+        
+        for file in files:
+            if file.endswith(('.rs', '.py', '.js')):
+                source_files.append(os.path.join(root, file))
+    
+    return sorted(source_files)
+
+def get_file_type(filepath):
+    """Determine file type based on extension"""
+    if filepath.endswith('.rs'):
+        return 'rust'
+    elif filepath.endswith('.py'):
+        return 'python'
+    elif filepath.endswith('.js'):
+        return 'javascript'
+    return 'unknown'
+
+def extract_doc_comments(lines, line_num, file_type):
+    """Extract documentation comments before the given line based on file type"""
+    docs = []
+    # Look at previous lines for doc comments
+    for i in range(max(0, line_num - 5), line_num):
+        if i < len(lines):
+            line = lines[i].strip()
+            if file_type == 'rust':
+                if line.startswith('///') or line.startswith('//!'):
+                    docs.append(line)
+            elif file_type == 'python':
+                if line.startswith('"""') or line.startswith("'''") or line.startswith('#'):
+                    docs.append(line)
+            elif file_type == 'javascript':
+                if line.startswith('/**') or line.startswith('*') or line.startswith('//'):
+                    docs.append(line)
+    return docs
+
+def get_patterns_for_file_type(file_type):
+    """Get regex patterns for different file types"""
+    if file_type == 'rust':
+        return re.compile(r'^\s*(pub\s+)?(fn|struct|enum|impl|trait)\s+')
+    elif file_type == 'python':
+        return re.compile(r'^\s*(def|class|async\s+def)\s+')
+    elif file_type == 'javascript':
+        return re.compile(r'^\s*(function|class|export\s+(function|class))\s+')
+    return None
+
+def scan_source_file(filepath):
+    """Scan a source file for functions, classes, structs, etc."""
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+    except Exception as e:
+        print(f"Error reading {filepath}: {e}", file=sys.stderr)
+        return []
+    
+    file_type = get_file_type(filepath)
+    pattern = get_patterns_for_file_type(file_type)
+    
+    if not pattern:
+        return []
+    
+    results = []
+    
+    for i, line in enumerate(lines, 1):
+        if pattern.match(line):
+            # Extract doc comments from previous lines
+            doc_comments = extract_doc_comments(lines, i - 1, file_type)
+            
+            # Clean up the line
+            clean_line = line.strip()
+            
+            results.append({
+                'line_num': i,
+                'content': clean_line,
+                'docs': doc_comments,
+                'file': filepath,
+                'type': file_type
+            })
+    
+    return results
+
+def main():
+    # Get target directory from command line or use current directory
+    if len(sys.argv) > 1:
+        target_dir = sys.argv[1]
+    else:
+        target_dir = '.'
+    
+    # Get the directory name for the header
+    dir_name = os.path.basename(os.path.abspath(target_dir))
+    print(f"<code-overview project=\"{dir_name}\">")
+    
+    # Find all source files
+    source_files = find_source_files(target_dir)
+    
+    for filepath in source_files:
+        # Make path relative to target directory
+        rel_path = os.path.relpath(filepath, target_dir).replace('\\', '/')
+        file_type = get_file_type(filepath)
+        print(f"  <file path=\"{rel_path}\" type=\"{file_type}\">")
+        
+        # Scan the file
+        items = scan_source_file(filepath)
+        
+        for item in items:
+            if item['docs']:
+                # Calculate line range for items with docs
+                start_line = item['line_num'] - len(item['docs'])
+                end_line = item['line_num']
+                print(f"    <item lines=\"{start_line}:{end_line}\">")
+                
+                # Print docs and code with proper indentation
+                for doc in item['docs']:
+                    print(f"      {doc}")
+                print(f"      {item['content']}")
+                print("    </item>")
+            else:
+                # Single line for items without docs
+                print(f"    <item line=\"{item['line_num']}\">{item['content']}</item>")
+        
+        print("  </file>")
+    
+    print("</code-overview>")
+
+if __name__ == '__main__':
+    main()
